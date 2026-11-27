@@ -4,7 +4,7 @@ context:
   name: stdio
   opam_name: stdio
   version: "0.17.0"
-  build_number: 0
+  build_number: 1
 
   # ocaml_win-64 ships gcc_* and vs_* at the same version/build; name the track.
   c_toolchain: ${{ "" if unix else c_compiler ~ "_*" }}
