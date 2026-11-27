@@ -6,10 +6,13 @@ context:
   version: "0.17.0"
   build_number: 0
 
+  # ocaml_win-64 ships gcc_* and vs_* at the same version/build; name the track.
+  c_toolchain: ${{ "" if unix else c_compiler ~ "_*" }}
   library: ${{ "Library/" if not unix else "" }}
-  m2: ${{ "m2-" if not unix else "" }}
-  # ocaml_<platform> matchspec tail: version, plus the gcc_ (MinGW) track on non-unix
-  ocaml_spec: ${{ ocaml_compiler_version ~ (".*" if unix else ".* gcc_*") }}
+  # static archive paired with the .cmxa: msvc ships .lib, gcc and unix ship .a
+  native_lib_ext: ${{ ".lib" if c_compiler == "vs" else ".a" }}
+  # ELF machine token `file` prints for the target; checked by the arch test
+  elf_arch: ${{ "x86-64" if target_platform == "linux-64" else "aarch64" if target_platform == "linux-aarch64" else "PowerPC" if target_platform == "linux-ppc64le" else "RISC-V" if target_platform == "linux-riscv64" else "S/390" if target_platform == "linux-s390x" else "" }}
 
 package:
   name: ocaml-${{ name }}
@@ -21,42 +24,66 @@ source:
 
 build:
   number: ${{ build_number }}
-  string: ${{ "gcc_" if not unix }}h${{ hash }}_${{ build_number }}
-  script: bash ${{ RECIPE_DIR }}/build.sh ${{ opam_name }}
+  string: ${{ c_compiler ~ "_" if not unix }}h${{ hash }}_${{ build_number }}
+  script:
+    - if: unix
+      then:
+        - dune build -p ${{ opam_name }} --profile=release -j "${CPU_COUNT:-1}" @install
+        - dune install -p ${{ opam_name }} --prefix="${PREFIX}" --libdir="${PREFIX}/lib/ocaml" --docdir="${PREFIX}/share/doc" --mandir="${PREFIX}/share/man"
+      else:
+        # Plain cmd.exe, not MSYS2 bash: pure OCaml, no stubs, so no wrapper is
+        # needed and the backslashed install prefix reaches dune intact. The
+        # dune cache trips over mixed path separators on windows.
+        # dune install also opens the shared cache; disable it for every dune call
+        - set DUNE_CACHE=disabled
+        - dune build -p ${{ opam_name }} --cache=disabled --profile=release @install
+        - if errorlevel 1 exit 1
+        - dune install -p ${{ opam_name }} --prefix="%LIBRARY_PREFIX%" --libdir="%LIBRARY_PREFIX%\lib\ocaml" --docdir="%LIBRARY_PREFIX%\share\doc" --mandir="%LIBRARY_PREFIX%\share\man"
+        - if errorlevel 1 exit 1
 
 requirements:
   build:
     - ${{ compiler("ocaml") }}
-    # compiler("ocaml") renders no toolchain track; name the gcc_ (MinGW) one on non-unix
-    - ocaml_${{ target_platform }} ${{ ocaml_spec }}
-    # no C stubs; ocamlopt still links through the C compiler on non-unix
-    - if: unix
+    - if: not unix and c_compiler == "gcc"
       then:
-        - ${{ stdlib("c") }}
-      else:
-        - ${{ compiler("m2w64_c") }}
         - ${{ stdlib("m2w64_c") }}
-    - ocaml-dune >=3.11
-    - ${{ m2 }}make
+      else:
+        - ${{ stdlib("c") }}
+    # ocaml_win-64 >=14 only run-constrains the C compiler; activate it here, once (vs, zig)
+    - if: not unix and c_compiler != "gcc"
+      then:
+        - ${{ compiler("zig") if c_compiler == "zig" else compiler("c") }}
+    # compiler("ocaml") renders no toolchain track; name it on windows
     - if: not unix
       then:
-        - m2-bash
-        - m2-coreutils
-        - m2-sed
-        - m2-grep
-        - m2-findutils
+        - ocaml_${{ target_platform }} ${{ ocaml_compiler_version }}.* ${{ c_toolchain }}
+    # the cross compiler does not pull the native one; the build runs OCaml on the build machine
+    - if: build_platform != target_platform and unix
+      then:
+        - ocaml_${{ build_platform }} ${{ ocaml_compiler_version }}.*
+        # the cross compiler activates itself (shims, OCAMLLIB, host OCAMLPATH)
+        - ocaml_${{ target_platform }} ${{ ocaml_compiler_version }}.*
+    # windows cross: the self-contained gcc track needs no vcvars
+    - if: build_platform != target_platform and not unix
+      then:
+        - ocaml_${{ build_platform }} ${{ ocaml_compiler_version }}.* gcc_*
+    - ocaml-dune >=3.11
   host:
     # library: ocaml's run_export pins the compiler patch version
-    - ocaml ${{ ocaml_spec }}
+    - ocaml ${{ ocaml_compiler_version }}.*
+    # the noarch ocaml metapackage does not pin the windows toolchain track
+    - if: not unix
+      then:
+        - ocaml_${{ target_platform }} ${{ ocaml_compiler_version }}.* ${{ c_toolchain }}
     - ocaml-dune >=3.11
     - ocaml-base >=0.17,<0.18
   run:
     - ocaml-base >=0.17,<0.18
-  # the ocaml run_export does not encode the non-unix toolchain track
+  # the ocaml run_export does not encode the windows toolchain track
   run_constraints:
     - if: not unix
       then:
-        - ocaml_${{ target_platform }} ${{ ocaml_spec }}
+        - ocaml_${{ target_platform }} ${{ ocaml_compiler_version }}.* ${{ c_toolchain }}
     # installed dune-package declares (lang dune X.Y); older dune cannot read it
     - ${{ pin_compatible('ocaml-dune', lower_bound='x.x', upper_bound=None) }}
 
@@ -65,33 +92,65 @@ tests:
       files:
         - ${{ library }}lib/ocaml/${{ opam_name }}/META
         - ${{ library }}lib/ocaml/${{ opam_name }}/${{ opam_name }}.cma
-        - ${{ library }}lib/ocaml/${{ opam_name }}/${{ opam_name }}.cmxa
-        - ${{ library }}lib/ocaml/${{ opam_name }}/${{ opam_name }}.a
-        - ${{ library }}lib/ocaml/${{ opam_name }}/${{ opam_name }}.cmxs
-  - script:
-      interpreter: bash
-      content:
-        - export DUNE_CACHE=disabled
-        - LIBDIR=$PREFIX/lib/ocaml; SEP=':'
-        - if [[ -d $PREFIX/Library/lib/ocaml ]]; then LIBDIR=$PREFIX/Library/lib/ocaml; SEP=';'; fi
-        - export OCAMLPATH="$LIBDIR${OCAMLPATH:+$SEP$OCAMLPATH}"
-        - echo '(lang dune 3.0)' > dune-project
-        - echo '(executable (name t) (libraries stdio))' > dune
-        - echo 'let () = Stdio.print_string "stdio ok"' > t.ml
-        - dune build --root . ./t.exe
-        - ./_build/default/t.exe | grep -q "stdio ok"
-    requirements:
-      run:
-        - ocaml ${{ ocaml_spec }}
-        - ocaml-dune >=3.11
-        - if: unix
+        - ${{ library }}lib/ocaml/${{ opam_name }}/${{ opam_name }}.cmi
+        # win-arm64 is bytecode-only upstream: OCaml 5.4 has no arm64 Windows backend
+        - if: target_platform != "win-arm64"
           then:
-            - ${{ compiler("c") }}
-        - if: not unix
-          then:
-            - m2-bash
-            - m2-coreutils
-            - m2-grep
+            - ${{ library }}lib/ocaml/${{ opam_name }}/${{ opam_name }}.cmxa
+            - ${{ library }}lib/ocaml/${{ opam_name }}/${{ opam_name }}.cmxs
+            - ${{ library }}lib/ocaml/${{ opam_name }}/${{ opam_name }}${{ native_lib_ext }}
+
+  # link test: needs a toolchain that runs on the build machine and a native backend
+  # win-arm64 is bytecode-only (no native link)
+  - if: build_platform == target_platform and target_platform != "win-arm64"
+    then:
+      script:
+        interpreter: bash
+        content:
+          - export DUNE_CACHE=disabled
+          - LIBDIR=$PREFIX/lib/ocaml; SEP=':'
+          - if [[ -d $PREFIX/Library/lib/ocaml ]]; then LIBDIR=$PREFIX/Library/lib/ocaml; SEP=';'; fi
+          - export OCAMLPATH="$LIBDIR${OCAMLPATH:+$SEP$OCAMLPATH}"
+          - echo '(lang dune 3.0)' > dune-project
+          - echo '(executable (name t) (libraries stdio))' > dune
+          - echo 'let () = Stdio.print_string "stdio ok"' > t.ml
+          - dune build --root . ./t.exe
+          - ./_build/default/t.exe | grep -q "stdio ok"
+      requirements:
+        run:
+          - ocaml ${{ ocaml_compiler_version }}.*
+          - ocaml-dune >=3.11
+          - if: unix
+            then:
+              - ${{ compiler("c") }}
+          - if: not unix
+            then:
+              - ocaml_${{ target_platform }} ${{ ocaml_compiler_version }}.* ${{ c_toolchain }}
+              - m2-bash
+              - m2-coreutils
+              - m2-grep
+          - if: not unix and c_compiler != "gcc"
+            then:
+              - ${{ compiler("c") }}
+
+  # cross lanes test under qemu binfmt, which would also run a build-machine
+  # binary; check the native objects' ELF headers name the target instead
+  - if: linux
+    then:
+      script:
+        # test scripts are not jinja-rendered; hand the token over by env
+        env:
+          ELF_ARCH: ${{ elf_arch }}
+        content:
+          - mkdir -p objs
+          - cd objs
+          - ar x "${PREFIX}/lib/ocaml/${{ opam_name }}/${{ opam_name }}.a"
+          - file -L ./*.o
+          - test -z "$(file -L ./*.o | grep -v "${ELF_ARCH}")"
+      requirements:
+        build:
+          - file
+          - binutils
 
 about:
   homepage: https://github.com/janestreet/stdio
